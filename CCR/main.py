@@ -10,6 +10,7 @@ from typing import Dict, Any, Optional, Tuple
 import traceback
 import urllib3
 import email as email_parser
+import base64
 
 '''CONFIGURAÇÕES DE USUARIO, EMAIL E SENHA'''
 host = 'imap.gmail.com'
@@ -27,7 +28,7 @@ download_folder = "/tmp" #Local para salvar o arquivo por enquanto vai ficar no 
 os.makedirs(download_folder, exist_ok=True)
 
 # Adicionar DEBUG para importação de email
-print("[DEBUG] Importando módulos necessários")
+# print("[DEBUG] Importando módulos necessários")
 def connect_email():
     """Conecta ao servidor IMAP e retorna a conexão."""
     print("[DEBUG] Iniciando conexão ao servidor de email")
@@ -42,26 +43,27 @@ def connect_email():
 # verifica se tem emails nao lido
 def process_new_emails():
     """Busca o último e-mail não lido e processa seu anexo."""
-    print("[DEBUG] Iniciando processamento de novos emails")
+    #print("[DEBUG] Iniciando processamento de novos emails")
+    extract_email = {}
     mail = connect_email()
-    print("[DEBUG] Selecionando caixa de entrada")
+    #print("[DEBUG] Selecionando caixa de entrada")
     mail.select("inbox")
 
     # Buscar e-mails não lidos
-    print("[DEBUG] Buscando emails não lidos")
+    #print("[DEBUG] Buscando emails não lidos")
     status, email_ids = mail.search(None, '(UNSEEN)')
-    print(f"[DEBUG] Status da busca: {status}")
+    #print(f"[DEBUG] Status da busca: {status}")
     email_list = email_ids[0].split()
-    print(f"[DEBUG] Quantidade de emails não lidos: {len(email_list)}")
+    #print(f"[DEBUG] Quantidade de emails não lidos: {len(email_list)}")
 
     if not email_list:
         print("Nenhum e-mail não lido encontrado.")
         return None, None  # Retorna None para indicar que não há emails
 
     latest_email_id = email_list[-1]  # Pega o último e-mail não lido
-    print(f"[DEBUG] Buscando conteúdo do email ID: {latest_email_id}")
+    #print(f"[DEBUG] Buscando conteúdo do email ID: {latest_email_id}")
     status, email_data = mail.fetch(latest_email_id, "(RFC822)")
-    print(f"[DEBUG] Status da busca de conteúdo: {status}")
+    #print(f"[DEBUG] Status da busca de conteúdo: {status}")
 
     raw_email = email_data[0][1]
     print("[DEBUG] Email obtido, processando dados brutos")
@@ -98,7 +100,9 @@ def process_new_emails():
             continue
 
         filename = part.get_filename()
+        extract_email['file_name'] = filename
         if filename:
+            print(f"[DEBUG] Anexo encontrado: {filename}") 
             file_path = os.path.join(download_folder, filename)
             with open(file_path, "wb") as f:
                 payload = part.get_payload(decode=True)
@@ -107,22 +111,23 @@ def process_new_emails():
             # Ler os bytes do documento diretamente
             with open(file_path, "rb") as doc_file:
                 document_bytes = doc_file.read()
+                base64_encoded = base64.b64encode(document_bytes).decode('utf-8')
+                extract_email['base64_file'] = base64_encoded
+                print(f"[DEBUG] Base65 do arquivo: {base64_encoded[:20]}")
                 result = get_full_text(document_bytes)
-                if isinstance(result, tuple) and len(result) == 2:
-                    extracted_text, text_confidence = result
-                    break  
+                extract_email['extracted_text'], extract_email['text_confidence'] = result
     
     if document_bytes is None:
         print("Nenhum anexo encontrado.")
     print("[DEBUG] Processamento de email concluído!")
-    return extracted_text, text_confidence
+    return extract_email, {}
 
 def get_full_text(document_bytes: bytes) -> Optional[Tuple[str, dict]]:
     try:
         '''Envia documento de anexo para o textract'''
         print(f"[DEBUG] Sending document to Textract")
         response = textract.detect_document_text(Document={'Bytes': document_bytes})
-        print("[DEBUG] Resposta recebida do Textract")
+        print("[DEBUG] Resposta recebida do Textract")        
 
         '''Extrai blocos de texto da resposta da linha de cima'''
         text_blocks = [item.get('Text', '') for item in response.get('Blocks', []) if item.get('BlockType') == 'LINE']
@@ -138,6 +143,7 @@ def get_full_text(document_bytes: bytes) -> Optional[Tuple[str, dict]]:
         
         '''Junta todos os blocos de texto em uma única string'''
         full_text = " ".join(text_blocks)
+        #print("text_full", full_text)
         
         return full_text, text_confidence
     except Exception as e:
@@ -176,16 +182,16 @@ def process_extracted_text(extracted_text, text_confidence):
             # Extrair RG diretamente do texto
             print("[DEBUG] Chamando extract_rg")
             rg_result = extract_rg(extracted_text, text_confidence)
-            cnh_result = extract_cpf(extracted_text, text_confidence)
+            cpf_result = extract_cpf(extracted_text, text_confidence)
             nome_social = extract_social_name(extracted_text, text_confidence)
             print(f"[DEBUG] Resultado extract_rg: {rg_result}")
-            print(f"[DEBUG] Resultado cnh_result: {cnh_result}")
+            print(f"[DEBUG] Resultado cnh_result: {cpf_result}")
             print(f"[DEBUG] Resultado para o nome socal: {nome_social}")
             if isinstance(rg_result, tuple) and len(rg_result) == 2:
                 extracted_info['rg_number'], extracted_info['confidence_score_rg'] = rg_result
                 print(f"[DEBUG] RG extraction result: {extracted_info['rg_number']}, confidence: {extracted_info['confidence_score_rg']}")
-            if isinstance(cnh_result, tuple):
-                extracted_info['cpf_number'], extracted_info['confidence_score_cpf'] = cnh_result
+            if isinstance(cpf_result, tuple):
+                extracted_info['cpf_number'], extracted_info['confidence_score_cpf'] = cpf_result
                 print(f"[DEBUG] CPF extraction result: {extracted_info['cpf_number']}, confidence: {extracted_info['confidence_score_cpf']}")
             if isinstance(nome_social, tuple):
                 extracted_info['nome_social'], extracted_info['confidence_score_name'] = nome_social
@@ -196,11 +202,68 @@ def process_extracted_text(extracted_text, text_confidence):
     print(f"[DEBUG] Informações extraídas: {extracted_info}")
     return extracted_info
 
+def import_document(extracted_info):
+    
+    url = "https://isc.softexpert.com/apigateway/se/ws/dc_ws.php"
+    authorization = "eyJhbGciOiJIUzI1NiJ9.eyJpYXQiOjE3MzkyOTk0NTAsImV4cCI6MTg5NzA2NTg1MCwiaWRsb2dpbiI6ImFsaW5vIn0.UY5DZHix28g_pr-V8A-rJYpOCU9MPta6Lc3uKkoGxqw"
+    headers = {
+        "Authorization": authorization,
+        "SOAPAction": "urn:document#newDocument2",
+        "Content-Type": "text/xml;charset=utf-8"
+    }
+    cpf = extracted_info.get("cpf_number")
+    nome = extracted_info.get("nome_social")
+    rg = extracted_info.get("rg_number")
+    base64_rg = extracted_info.get('base64_file')
+    file_name = extracted_info.get('file_name')
+    iddocument = f"{cpf} - {nome}"
+    print("[DEBUG] Este é o CPF",cpf)
+    print("[DEBUG] Este é o nome",nome)
+    print("[DEBUG] Este é o title", iddocument)
+    
+    payload = f"""
+        <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:urn="urn:document">
+        <soapenv:Header/>
+        <soapenv:Body>
+            <urn:newDocument2>
+                <!--You may enter the following 13 items in any order-->
+                <urn:CategoryID>novocolaborador</urn:CategoryID>
+                <urn:DocumentID>iddocument</urn:DocumentID>
+                <urn:Title>nome</urn:Title>
+                <urn:Attributes>
+                    <urn:item>
+                    <urn:ID>tgncnpj</urn:ID>
+                        <urn:item>
+                            <urn:Value>{cpf}</urn:Value>
+                        </urn:item>
+                    <urn:ID>RG</urn:ID>
+                        <urn:item>
+                            <urn:Value>{rg}</urn:Value>
+                        </urn:item>
+                    </urn:item>
+                </urn:Attributes>
+                <urn:Files>
+                    <urn:item>
+                    <urn:Name>{file_name}</urn:Name>
+                    <urn:Content>{base64_rg}</urn:Content>
+                    </urn:item>
+                </urn:Files>
+            </urn:newDocument2>
+        </soapenv:Body>
+        </soapenv:Envelope>"""
+        
+    http = urllib3.PoolManager()
+    req = http.request('POST', url=url, headers=headers, body=payload.encode('utf-8'))  # Envia em UTF-8
+    print(f"Req")
+    return {"status_code": req.status}
+
 '''Função que faz o match das informações, procura o RG em dois padrões'''
 def extract_rg(text: str, confidence_score: dict):
     match = re.search(r'\D(\d{1}\.\d{3}\.\d{3})\D', text)
     if not match:
         match = re.search(r'\D(\d{3}\.\d{3}\.\d{3}-\d{1})\D', text)  
+        if not match:
+            match = re.search(r'UF\s*(\d+)', text)
     if match:
         result = match.group(1)      
         print(f"[DEBUG] RG encontrado: {result}")
@@ -217,29 +280,36 @@ def extract_cpf(text: str, confidence_score: dict):
     confidence = confidence_score.get(result, 0.0)
     print(f"[DEBUG] CPF extraction result: {result}")
     print(f"[DEBUG] CPF extraction result confidence: {confidence}")
-    return None, 0.0
+    return result, confidence
 
 '''Função que faz o match do nome social no texto extraído'''
 def extract_social_name(text: str, confidence_score: dict):
-    match = re.search(r'NOME SOCIAL\s*([A-Z\s]+)', text)
+    """
+    Extrai o Nome Social do texto, mesmo que esteja tudo em uma única linha.
+    """
+    match = re.search(r'HABILITAÇÃO\s+([A-Z\s]+?)\s+\d', text)  
     if match:
         result = match.group(1).strip()
         print(f"[DEBUG] Nome social encontrado: {result}")
-        # Buscar o confidence de um trecho de texto
-        confidence = confidence_score.get(result, 0.0)
+        confidence = confidence_score.get(result, 0.0)  # Busca a confiança
         print(f"[DEBUG] Confiança para o Nome Social: {confidence}")
         return result, confidence
+
     print("[DEBUG] Nome Social não encontrado.")
-    return None, 0.0  # Valor padrão quando não encontrado
+    return None, 0.0  # Retorno padrão quando não encontrado
 
 def lambda_handler(event, context):
     try:
         # Processar um único email e obter o texto extraído
-        extracted_text, text_confidence = process_new_emails()
-        
-        if extracted_text:
+        # extracted_text, text_confidence = process_new_emails()
+        extract_email = process_new_emails()
+        if extract_email['extracted_text']:
             # Processar o texto extraído diretamente
-            extracted_info = process_extracted_text(extracted_text, text_confidence)
+            extracted_info = process_extracted_text(extract_email['extracted_text'], extract_email['text_confidence'])
+            extract_email['cpf_number'] = extracted_info['cpf_number']
+            extract_email['rg_number'] = extracted_info['rg_number']
+            extract_email['nome_social'] = extracted_info['nome_social']
+            import_document(extract_email)
             return {
                 'statusCode': 200, 
                 'body': json.dumps({

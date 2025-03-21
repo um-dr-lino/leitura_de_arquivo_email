@@ -1,5 +1,3 @@
-
-# from imbox import Imbox
 import imaplib
 import json
 import os
@@ -11,9 +9,11 @@ import traceback
 import urllib3
 import email as email_parser
 import base64
-import xml.etree.ElementTree as ET
 import unicodedata 
+from lxml import etree as et
 
+
+cache = ()
 #CONFIGURAÇÕES DE USUARIO, EMAIL E SENHA
 host = 'imap.gmail.com'
 email = 'linolinocatolica@gmail.com'
@@ -36,9 +36,46 @@ def connect_email():
     print("[DEBUG] Login bem-sucedido")
     return mail
 
+def generation_dynamic_xml(iddocument, nome, cpf, rg, birth_date, voter_registration, data):
+    
+    parser = et.XMLParser(remove_blank_text=True)
+    payload = f"""
+    <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:urn="urn:document">
+    <soapenv:Header/>
+    <soapenv:Body>
+        <urn:newDocument>
+                <urn:idcategory>novocolaborador</urn:idcategory>
+                <urn:iddocument>{iddocument}</urn:iddocument>
+                <urn:title>{nome}</urn:title>
+                <urn:dsresume>Importado via integracao</urn:dsresume>
+                <urn:attributes>cpfnovo={cpf};RG={rg};aniver={birth_date};tituloeleitor={voter_registration}</urn:attributes>
+            <urn:file>
+            </urn:file>
+        </urn:newDocument>
+    </soapenv:Body>
+    </soapenv:Envelope>"""  
+    
+    root = et.fromstring(payload, parser)
+    ns = {'soapenv': 'http://schemas.xmlsoap.org/soap/envelope/', 'urn': 'urn:document'}
+    
+    file_selection = root.find(".//urn:file", namespaces=ns)
+    
+    for data_info in data.get('document_file',[]):
+        item = et.Element("{urn:document}item")
+        nmfile = et.SubElement(item, "{urn:document}NMFILE")
+        nmfile.text = data_info['NMFILE']
+        binfile = et.SubElement(item, "{urn:document}BINFILE")
+        binfile.text = data_info['BINFILE']
+        
+        file_selection.append(item)
+    # print("et.tostring(root, pretty_print=True, encoding='utf-8').decode('utf-8')", 
+    # et.tostring(root, pretty_print=True, encoding='utf-8').decode('utf-8')
+    return et.tostring(root, pretty_print=True, encoding='utf-8').decode('utf-8')
+
 def process_new_emails():
-    #Busca o último e-mail não lido e processa seu anexo.
-    extract_email = {}
+    # Busca o último e-mail não lido e processa seus anexos.
+    collection_attachment = {'document_file': []}
+    extract_emails = []  # Changed to a list to store multiple attachments
     mail = connect_email()
     mail.select("inbox")
 
@@ -51,9 +88,7 @@ def process_new_emails():
         return None, None  # Retorna None para indicar que não há emails
 
     latest_email_id = email_list[-1]  # Pega o último e-mail não lido
-    #print(f"[DEBUG] Buscando conteúdo do email ID: {latest_email_id}")
     status, email_data = mail.fetch(latest_email_id, "(RFC822)")
-    #print(f"[DEBUG] Status da busca de conteúdo: {status}")
 
     raw_email = email_data[0][1]
     print("[DEBUG] Email obtido, processando dados brutos")
@@ -62,7 +97,7 @@ def process_new_emails():
     if isinstance(raw_email, str):
         print("[DEBUG] Convertendo email de string para bytes")
         raw_email = raw_email.encode('utf-8')
-        msg = email_parser.message_from_bytes(raw_email) 
+        msg = email_parser.message_from_bytes(raw_email)
 
     msg = email_parser.message_from_bytes(raw_email) 
 
@@ -71,18 +106,23 @@ def process_new_emails():
     print(f"**Assunto:** {msg['Subject']}")
 
     print("[DEBUG] Procurando por anexos no email")
-    """ Criando variaveis e atribuindo valores nulo """
-    document_bytes = None    
-    #Função para verificar se dentro do email tem anexo
+    
+    has_attachments = False
+    # Função para verificar se dentro do email tem anexo
     for part in msg.walk():
         if part.get_content_maintype() == "multipart":
             continue
         if part.get("Content-Disposition") is None:
             continue
+            
         filename = part.get_filename()
-        extract_email['file_name'] = filename
         if filename:
-            print(f"[DEBUG] Anexo encontrado: {filename}") 
+            has_attachments = True
+            print(f"[DEBUG] Anexo encontrado: {filename}")
+            
+            # Create a new extract_email dictionary for each attachment
+            extract_email = {'file_name': filename}
+            
             file_path = os.path.join(download_folder, filename)
             with open(file_path, "wb") as f:
                 payload = part.get_payload(decode=True)
@@ -95,11 +135,19 @@ def process_new_emails():
                 extract_email['base64_file'] = base64_encoded
                 result = get_full_text(document_bytes)
                 extract_email['extracted_text'], extract_email['text_confidence'] = result
+            
+            # Add the processed attachment to our list
+            extract_emails.append(extract_email)
+            
+            # Also update the collection_attachment
+            data = {'NMFILE': filename, 'BINFILE': base64_encoded}
+            collection_attachment.get('document_file').append(data)
     
-    if document_bytes is None:
+    if not has_attachments:
         print("Nenhum anexo encontrado.")
     print("[DEBUG] Processamento de email concluído!")
-    return extract_email
+    
+    return extract_emails, collection_attachment
 
 def get_full_text(document_bytes: bytes) -> Optional[Tuple[str, dict]]:
     try:
@@ -122,13 +170,13 @@ def get_full_text(document_bytes: bytes) -> Optional[Tuple[str, dict]]:
         
         '''Junta todos os blocos de texto em uma única string'''
         full_text = " ".join(text_blocks)
-        print("text_full", full_text)
+        # print("text_full", full_text)
         
         return full_text, text_confidence
     except Exception as e:
         print(f"[ERROR] Textract error: {str(e)}")
-        print(f"[ERROR] Traceback: {traceback.format_exc()}")
-        return None, {}  # Retornando None para indicar erro
+        print(f"[ERROR] Traceback1: {traceback.format_exc()}")
+        return None  # Retornando None para indicar erro
 
 #Função que faz o match das informações, procura o RG em três padrões
 def extract_rg(text: str, confidence_score: dict):
@@ -178,12 +226,9 @@ def extract_nome(text: str, confidence_score: dict):
     return None, 0.0  # Retorno padrão quando não encontrado
 
 def extract_birthdate(text: str, confidence_score: dict):
-    # Expressão regular para capturar datas no formato DD/MM/AAAA, DD-MM-AAAA ou DD.MM.AAAA
     date_pattern = r'\b(\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4})\b'
-    
     # Encontra todas as datas no texto
     matches = re.findall(date_pattern, text)
-
     if len(matches) >= 2:
         result = matches[1]  # Retorna a segunda data encontrada
         print(f"[DEBUG] Segunda data de nascimento encontrada: {result}")
@@ -193,55 +238,101 @@ def extract_birthdate(text: str, confidence_score: dict):
     else:
         print("[DEBUG] Nenhuma data de nascimento encontrada.")
         return None, 0.0  # Retorno padrão caso não encontre nenhuma data
-
     # Obtém a confiança da data extraída (se existir no dicionário)
     confidence = confidence_score.get(result, 0.0)
     print(f"[DEBUG] Confiança para a data de nascimento: {confidence}")
-
     return result, confidence
 
+#Função que faz o match do número do título de eleitor
+def extract_registration_voter(text: str, confidence_score: dict):
+    """Extrai o número do título de eleitor em diferentes formatos."""
+    
+    # Define patterns at the beginning of the function so they're always available
+    patterns = [
+        r'\b\d{4} \d{4} \d{4}\b',  # 0000 0000 0000
+        r'\b\d{4}\.\d{4}\.\d{4}\b',  # 0000.0000.0000
+        r'\b\d{3}\.\d{4} \d{4}\b',  # 000.0000 0000
+        r'\b\d{3} \d{4}\.\d{4}\b',   # 000 0000.0000
+        r'\b\d{4}\.\d{4} \d{4}\b',  # 0000.0000 0000
+        r'\b\d{4} \d{4}\.\d{4}\b'   # 0000 0000.0000
+    ]
+    
+    print(f"[DEBUG] Procurando 'MUNICÍPIO' no texto...")
+    municipio_match = re.search(r"\bMUNICÍPIO\b", text, re.IGNORECASE)
+    if municipio_match:
+        print(f"[DEBUG] 'MUNICÍPIO' encontrado na posição {municipio_match.start()}")
+    else:
+        print(f"[DEBUG] 'MUNICÍPIO' não encontrado no texto!")
+    
+    match = re.search(r"(.*?)\bMUNICÍPIO\b", text, re.IGNORECASE)
+    
+    if match:
+        texto_antes_municipio = match.group(1)  # Trecho antes de MUNICÍPIO
+        print(f"[DEBUG] Texto antes de MUNICÍPIO: '{texto_antes_municipio}'")
+
+        for i, pattern in enumerate(patterns):
+            print(f"[DEBUG] Tentando padrão {i+1}: '{pattern}'")
+            match = re.search(pattern, texto_antes_municipio)
+            if match:
+                result = match.group(0)
+                confidence = confidence_score.get(result, 0.0)  # Obtém a confiança do dicionário
+                print(f"[DEBUG] Número do título de eleitor encontrado: {result} (Confiança: {confidence})")
+                return result, confidence
+            else:
+                print(f"[DEBUG] Padrão {i+1} não encontrou correspondência")
+
+        # If we get here, none of the patterns matched
+        print(f"[DEBUG] Nenhum dos padrões encontrou um título de eleitor antes de MUNICÍPIO")
+    
+    # Fallback: try searching the entire text if we couldn't find anything before MUNICÍPIO
+    print("[DEBUG] Tentando buscar título de eleitor em todo o texto...")
+    for i, pattern in enumerate(patterns):
+        match = re.search(pattern, text)
+        if match:
+            result = match.group(0)
+            confidence = confidence_score.get(result, 0.0)
+            print(f"[DEBUG] Número do título de eleitor encontrado no texto completo: {result} (Confiança: {confidence})")
+            return result, confidence
+
+    print("[DEBUG] Nenhum número de título de eleitor encontrado.")
+    return None, 0.0
+
+def work_card(text: str, confidence_score: dict):
+    match = re.search(r'\b\d{3}\.\d{5}\.\d{2}-\d\b', text)
+    result = match.group(0) if match else None
+    confidence = confidence_score.get(result, 0.0)   
+    if match:
+            result = match.group(0).strip()
+            print(f"[DEBUG] Nome encontrado: {result}")
+            confidence = confidence_score.get(result, 0.0)  # Busca a confiança
+            print(f"[DEBUG] Confiança para o Nome: {confidence}")
+            return result, confidence
+
 #importa para dentro do documento
-def create_document(extract_email):
+def create_document(extract_email, data):
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     http = urllib3.PoolManager()
     url = "https://isc.softexpert.com/apigateway/se/ws/dc_ws.php"
     authorization = "eyJhbGciOiJIUzI1NiJ9.eyJpYXQiOjE3MzkyOTk0NTAsImV4cCI6MTg5NzA2NTg1MCwiaWRsb2dpbiI6ImFsaW5vIn0.UY5DZHix28g_pr-V8A-rJYpOCU9MPta6Lc3uKkoGxqw"
     headers = {
         "Authorization": authorization,
-        "SOAPAction": "urn:document#newDocument2",
+        "SOAPAction": "urn:document#newDocument",
         "Content-Type": "text/xml;charset=utf-8"
     }
-    cpf = clean_text(extract_email.get("cpf_number")[0])
+    cpf = extract_email.get("cpf_number")[0]
     nome = clean_text(extract_email.get("nome_social")[0])
-    rg = clean_text(extract_email.get("rg_number")[0])
+    rg = extract_email.get("rg_number")[0]
     base64_rg = extract_email.get("base64_file")
     file_name = extract_email.get("file_name")
     birth_date = extract_email.get("birth_date")[0]
+    voter_registration = extract_email.get("voter_registration")[0]
     iddocument = f"{cpf} - {nome}"
 
-    if not all([cpf, nome, rg, base64_rg, file_name]):
-        print("[ERRO] Dados obrigatórios ausentes!")
-        return {"status_code": 400, "message": "Erro: Dados incompletos."}
+    # if not all([cpf, nome, rg, base64_rg, file_name]):
+    #     print("[ERRO] Dados obrigatórios ausentes!")
+    #     return {"status_code": 400, "message": "Erro: Dados incompletos."}
     
-    payload = f"""
-    <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:urn="urn:document">
-    <soapenv:Header/>
-    <soapenv:Body>
-        <urn:newDocument>
-                <urn:idcategory>novocolaborador</urn:idcategory>
-                <urn:iddocument>{iddocument}</urn:iddocument>
-                <urn:title>{nome}</urn:title>
-                <urn:dsresume>Importado via integracao</urn:dsresume>
-                <urn:attributes>cpfnovo={cpf};RG={rg}</urn:attributes>
-            <urn:file>
-                <urn:item>
-                <urn:NMFILE>{file_name}</urn:NMFILE>
-                <urn:BINFILE>{base64_rg}</urn:BINFILE>
-                </urn:item>
-            </urn:file>
-        </urn:newDocument>
-    </soapenv:Body>
-    </soapenv:Envelope>"""  
+    payload = generation_dynamic_xml(iddocument, nome, cpf, rg, birth_date, voter_registration, data)
     http = urllib3.PoolManager()
     req = http.request('POST', url=url, headers=headers, body=payload)
     # print("[DEBUG] Resposta do servidor:", req.status, payload)
@@ -264,12 +355,13 @@ def clean_text(texto):
     return texto_limpo
     
 def lambda_handler(event, context):
+    global cache
     try:
         # Processar um único email e obter o texto extraído
-        extract_email = process_new_emails()
+        extract_emails, data = process_new_emails()
 
         # Verificar se o email foi extraído corretamente
-        if not extract_email or 'extracted_text' not in extract_email or not extract_email['extracted_text']:
+        if not extract_emails:
             print("[DEBUG] Nenhum email encontrado ou sem texto extraído. Processando corpo da solicitação...")
             return {
                 'statusCode': 404, 
@@ -277,23 +369,37 @@ def lambda_handler(event, context):
                     'message': 'No content to process'
                 })
             }
-
-        # Processar o texto extraído diretamente
-        extract_email['cpf_number'] = extract_cpf(extract_email['extracted_text'], extract_email['text_confidence'])
-        extract_email['rg_number'] = extract_rg(extract_email['extracted_text'], extract_email['text_confidence'])
-        extract_email['nome_social'] = extract_nome(extract_email['extracted_text'], extract_email['text_confidence'])
-        extract_email['birth_date'] = extract_birthdate(extract_email['extracted_text'], extract_email['text_confidence'])
-        create_document(extract_email)
+            
+        # Process each attachment separately
+        for i, extract_email in enumerate(extract_emails):
+            print(f"[DEBUG] Processing attachment {i+1}/{len(extract_emails)}: {extract_email.get('file_name')}")
+            
+            if 'extracted_text' not in extract_email or not extract_email['extracted_text']:
+                print(f"[DEBUG] No text extracted from attachment {i+1}")
+                continue                
+            # print(f"[DEBUG] extracted_text for attachment {i+1}:", extract_email['extracted_text'])
+            # print(f"[DEBUG] text_confidence for attachment {i+1}:", extract_email['text_confidence'])
+            extract_email['cpf_number'] = extract_cpf(extract_email['extracted_text'], extract_email['text_confidence'])
+            extract_email['rg_number'] = extract_rg(extract_email['extracted_text'], extract_email['text_confidence'])
+            extract_email['nome_social'] = extract_nome(extract_email['extracted_text'], extract_email['text_confidence'])
+            extract_email['birth_date'] = extract_birthdate(extract_email['extracted_text'], extract_email['text_confidence'])
+            extract_email['voter_registration'] = extract_registration_voter(extract_email['extracted_text'], extract_email['text_confidence'])
+        # Add all processed attachments to cache
+        cache += (extract_emails,)
+        # Create document with all attachments
+        for extract_email in extract_emails:
+            create_document(extract_email, data)
+        
         return {
             'statusCode': 200, 
             'body': json.dumps({
-                'message': 'Email processed successfully'
+                'message': f'Email processed successfully with {len(extract_emails)} attachments'
             })
         }
 
     except Exception as e:
         print(f"[ERROR] Erro no processamento: {str(e)}")
-        print(f"[ERROR] Traceback: {traceback.format_exc()}")
+        print(f"[ERROR] Traceback2: {traceback.format_exc()}")
         return {
             'statusCode': 500, 
             'body': json.dumps({
